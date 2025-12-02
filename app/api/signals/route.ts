@@ -6,22 +6,22 @@ import { NextResponse } from 'next/server';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-const KRAKEN_FUTURES_BASE = 'https://futures.kraken.com/derivatives/api/v3';
-
-// PI_ = Perpetual Inverse (the main liquid contracts with funding data)
-// These are the symbols that have historical funding rate data
-const FUTURES_SYMBOLS: Record<string, { ticker: string; funding: string }> = {
-  'BTC': { ticker: 'pf_xbtusd', funding: 'PI_XBTUSD' },
-  'ETH': { ticker: 'pf_ethusd', funding: 'PI_ETHUSD' },
-  'SOL': { ticker: 'pf_solusd', funding: 'PI_SOLUSD' },
-  'XRP': { ticker: 'pf_xrpusd', funding: 'PI_XRPUSD' },
-  'LINK': { ticker: 'pf_linkusd', funding: 'PI_LINKUSD' },
-};
+const KRAKEN_BASE = 'https://futures.kraken.com';
 
 const ASSETS_TO_TRACK = ['BTC', 'ETH', 'SOL', 'XRP', 'LINK'];
 
+// Map display symbols to Kraken symbols
+const SYMBOL_MAP: Record<string, string> = {
+  'BTC': 'xbt',
+  'ETH': 'eth',
+  'SOL': 'sol',
+  'XRP': 'xrp',
+  'LINK': 'link',
+};
+
 interface TickerData {
   symbol: string;
+  tag: string;
   markPrice: number;
   bid: number;
   ask: number;
@@ -76,6 +76,54 @@ function generateSignal(zScore: number): { signal: SignalType; confidence: numbe
   return { signal: 'NEUTRAL', confidence: 0 };
 }
 
+async function fetchWithRetry(url: string): Promise<Response> {
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+      'User-Agent': 'KrakenTradingApp/1.0',
+    },
+    cache: 'no-store',
+  });
+  return response;
+}
+
+async function fetchFundingRates(symbol: string): Promise<{ rates: FundingRate[] | null; error?: string; url?: string }> {
+  const krakenSymbol = symbol === 'BTC' ? 'xbt' : symbol.toLowerCase();
+  
+  // Try multiple URL formats and symbol formats
+  const urlFormats = [
+    // PF_ format (Perpetual Fixed) - lowercase
+    `${KRAKEN_BASE}/derivatives/api/v3/historicalfundingrates?symbol=pf_${krakenSymbol}usd`,
+    // PF_ format - uppercase
+    `${KRAKEN_BASE}/derivatives/api/v3/historicalfundingrates?symbol=PF_${krakenSymbol.toUpperCase()}USD`,
+    // PI_ format (Perpetual Inverse) - lowercase
+    `${KRAKEN_BASE}/derivatives/api/v3/historicalfundingrates?symbol=pi_${krakenSymbol}usd`,
+    // PI_ format - uppercase  
+    `${KRAKEN_BASE}/derivatives/api/v3/historicalfundingrates?symbol=PI_${krakenSymbol.toUpperCase()}USD`,
+    // New API path with hyphens
+    `${KRAKEN_BASE}/api/v3/historical-funding-rates?symbol=pf_${krakenSymbol}usd`,
+    `${KRAKEN_BASE}/api/v3/historical-funding-rates?symbol=PF_${krakenSymbol.toUpperCase()}USD`,
+  ];
+
+  for (const url of urlFormats) {
+    try {
+      const response = await fetchWithRetry(url);
+      
+      if (response.ok) {
+        const data = await response.json();
+        if (data.result === 'success' && data.rates && data.rates.length > 0) {
+          return { rates: data.rates, url };
+        }
+      }
+    } catch {
+      // Continue to next URL
+    }
+  }
+
+  return { rates: null, error: 'All URL formats failed' };
+}
+
 export async function GET() {
   const errors: string[] = [];
   const signals: Signal[] = [];
@@ -83,21 +131,12 @@ export async function GET() {
 
   try {
     // Fetch all tickers
-    const tickersResponse = await fetch(`${KRAKEN_FUTURES_BASE}/tickers`, {
-      method: 'GET',
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'KrakenTradingApp/1.0',
-      },
-      cache: 'no-store',
-    });
+    const tickersResponse = await fetchWithRetry(`${KRAKEN_BASE}/derivatives/api/v3/tickers`);
 
     if (!tickersResponse.ok) {
-      const text = await tickersResponse.text();
       return NextResponse.json({
         success: false,
         error: `Kraken tickers API error: ${tickersResponse.status}`,
-        details: text.slice(0, 500),
         timestamp: new Date().toISOString(),
       }, { status: 502 });
     }
@@ -113,88 +152,86 @@ export async function GET() {
     }
 
     const tickers: TickerData[] = tickersData.tickers || [];
+    
+    // Find perpetual tickers
+    const perpetualTickers = tickers.filter(t => t.tag === 'perpetual');
     debug.tickerCount = tickers.length;
-    debug.sampleTickers = tickers.slice(0, 5).map(t => t.symbol);
+    debug.perpetualCount = perpetualTickers.length;
+    debug.perpetualSymbols = perpetualTickers.slice(0, 10).map(t => t.symbol);
 
     // Process each asset
     for (const symbol of ASSETS_TO_TRACK) {
       try {
-        const symbolConfig = FUTURES_SYMBOLS[symbol];
+        const krakenSymbol = SYMBOL_MAP[symbol];
         
-        // Find ticker - try multiple symbol formats
-        let ticker = tickers.find(t => 
-          t.symbol.toLowerCase() === symbolConfig.ticker.toLowerCase()
-        );
-        
-        // Also try PI_ format for ticker
-        if (!ticker) {
-          ticker = tickers.find(t => 
-            t.symbol.toLowerCase() === symbolConfig.funding.toLowerCase()
-          );
-        }
-
-        if (!ticker) {
-          errors.push(`No ticker for ${symbol}`);
-          continue;
-        }
-
-        // Fetch historical funding rates using PI_ symbol
-        const fundingUrl = `${KRAKEN_FUTURES_BASE}/historicalfundingrates?symbol=${symbolConfig.funding}`;
-        const fundingResponse = await fetch(fundingUrl, {
-          method: 'GET',
-          headers: {
-            'Accept': 'application/json',
-            'User-Agent': 'KrakenTradingApp/1.0',
-          },
-          cache: 'no-store',
+        // Find ticker - look for perpetual USD pair
+        const ticker = perpetualTickers.find(t => {
+          const s = t.symbol.toLowerCase();
+          return s === `pf_${krakenSymbol}usd` || 
+                 s === `pi_${krakenSymbol}usd`;
         });
 
-        if (!fundingResponse.ok) {
-          // Try lowercase
-          const fundingUrl2 = `${KRAKEN_FUTURES_BASE}/historicalfundingrates?symbol=${symbolConfig.funding.toLowerCase()}`;
-          const fundingResponse2 = await fetch(fundingUrl2, {
-            method: 'GET',
-            headers: { 'Accept': 'application/json', 'User-Agent': 'KrakenTradingApp/1.0' },
-            cache: 'no-store',
+        if (!ticker) {
+          errors.push(`No perpetual ticker for ${symbol}`);
+          continue;
+        }
+
+        debug[`ticker_${symbol}`] = ticker.symbol;
+
+        // Get current funding rate from ticker (this always works)
+        const currentFundingRate = ticker.fundingRate;
+        
+        // Try to fetch historical rates
+        const { rates, error: fundingError, url: workingUrl } = await fetchFundingRates(symbol);
+        
+        if (rates && rates.length >= 10) {
+          debug[`funding_${symbol}`] = { count: rates.length, url: workingUrl };
+          
+          const recentRates = rates.slice(-90).map(r => r.relativeFundingRate);
+          const zScore = calculateZScore(recentRates, currentFundingRate);
+          const { signal, confidence } = generateSignal(zScore);
+
+          const priceChange24h = ticker.open24h > 0 
+            ? ((ticker.last - ticker.open24h) / ticker.open24h) * 100 
+            : 0;
+
+          const annualizedRate = currentFundingRate * 3 * 365 * 100;
+
+          signals.push({
+            symbol,
+            signal,
+            zScore,
+            currentFundingRate,
+            annualizedRate,
+            price: ticker.last,
+            priceChange24h,
+            confidence,
+            timestamp: new Date().toISOString(),
+          });
+        } else {
+          // Fallback: use current funding rate only (Z-score = 0)
+          debug[`funding_${symbol}`] = { error: fundingError || 'No data' };
+          
+          const priceChange24h = ticker.open24h > 0 
+            ? ((ticker.last - ticker.open24h) / ticker.open24h) * 100 
+            : 0;
+
+          const annualizedRate = currentFundingRate * 3 * 365 * 100;
+
+          signals.push({
+            symbol,
+            signal: 'NEUTRAL',
+            zScore: 0,
+            currentFundingRate,
+            annualizedRate,
+            price: ticker.last,
+            priceChange24h,
+            confidence: 0,
+            timestamp: new Date().toISOString(),
           });
           
-          if (!fundingResponse2.ok) {
-            errors.push(`Funding fetch failed for ${symbol}: ${fundingResponse.status}`);
-            continue;
-          }
-          
-          const fundingData2 = await fundingResponse2.json();
-          if (fundingData2.result === 'success' && fundingData2.rates?.length > 0) {
-            // Use this data
-            const rates: FundingRate[] = fundingData2.rates;
-            processSignal(symbol, ticker, rates, signals);
-            continue;
-          }
+          errors.push(`No historical funding for ${symbol}, using current rate only`);
         }
-
-        const fundingData = await fundingResponse.json();
-        
-        // Debug: log what we got
-        if (!debug[`funding_${symbol}`]) {
-          debug[`funding_${symbol}`] = {
-            result: fundingData.result,
-            ratesCount: fundingData.rates?.length || 0,
-            error: fundingData.error,
-          };
-        }
-
-        if (fundingData.result !== 'success') {
-          errors.push(`Funding API error for ${symbol}: ${fundingData.error || fundingData.result}`);
-          continue;
-        }
-
-        if (!fundingData.rates || fundingData.rates.length === 0) {
-          errors.push(`No funding rates returned for ${symbol}`);
-          continue;
-        }
-
-        const rates: FundingRate[] = fundingData.rates;
-        processSignal(symbol, ticker, rates, signals);
 
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Unknown error';
@@ -227,33 +264,4 @@ export async function GET() {
       timestamp: new Date().toISOString(),
     }, { status: 500 });
   }
-}
-
-function processSignal(symbol: string, ticker: TickerData, rates: FundingRate[], signals: Signal[]) {
-  const recentRates = rates.slice(-90).map(r => r.relativeFundingRate);
-  const currentRate = ticker.fundingRate;
-
-  // Calculate Z-score
-  const zScore = calculateZScore(recentRates, currentRate);
-  const { signal, confidence } = generateSignal(zScore);
-
-  // Calculate 24h price change
-  const priceChange24h = ticker.open24h > 0 
-    ? ((ticker.last - ticker.open24h) / ticker.open24h) * 100 
-    : 0;
-
-  // Annualize funding rate (3 periods/day * 365 days)
-  const annualizedRate = currentRate * 3 * 365 * 100;
-
-  signals.push({
-    symbol,
-    signal,
-    zScore,
-    currentFundingRate: currentRate,
-    annualizedRate,
-    price: ticker.last,
-    priceChange24h,
-    confidence,
-    timestamp: new Date().toISOString(),
-  });
 }
