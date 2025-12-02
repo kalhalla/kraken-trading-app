@@ -1,5 +1,6 @@
 // API Route: /api/signals
-// Uses Kraken for current prices + Binance for historical funding rates (free!)
+// Uses Kraken for current prices + Binance for historical funding rates
+// Falls back to absolute thresholds if historical data unavailable
 
 import { NextResponse } from 'next/server';
 
@@ -27,6 +28,15 @@ const BINANCE_SYMBOLS: Record<string, string> = {
   'SOL': 'SOLUSDT',
   'XRP': 'XRPUSDT',
   'LINK': 'LINKUSDT',
+};
+
+// Absolute funding rate thresholds (used when no historical data)
+// Based on typical market ranges: neutral is ~0.01% per 8h (~10% annualized)
+const FUNDING_THRESHOLDS = {
+  STRONG_SHORT: 0.001,   // > 0.1% per 8h (~109% annualized) - very overleveraged long
+  SHORT: 0.0005,         // > 0.05% per 8h (~55% annualized) - overleveraged long
+  STRONG_LONG: -0.001,   // < -0.1% per 8h - very overleveraged short
+  LONG: -0.0005,         // < -0.05% per 8h - overleveraged short
 };
 
 interface KrakenTicker {
@@ -57,6 +67,7 @@ interface Signal {
   priceChange24h: number;
   confidence: number;
   timestamp: string;
+  signalSource: 'zscore' | 'threshold';
 }
 
 function calculateZScore(rates: number[], currentRate: number): number {
@@ -70,7 +81,7 @@ function calculateZScore(rates: number[], currentRate: number): number {
   return (currentRate - mean) / std;
 }
 
-function generateSignal(zScore: number): { signal: SignalType; confidence: number } {
+function generateSignalFromZScore(zScore: number): { signal: SignalType; confidence: number } {
   const absZ = Math.abs(zScore);
   
   if (zScore <= -2.5) return { signal: 'STRONG_LONG', confidence: Math.min(absZ / 3, 1) };
@@ -81,41 +92,74 @@ function generateSignal(zScore: number): { signal: SignalType; confidence: numbe
   return { signal: 'NEUTRAL', confidence: 0 };
 }
 
-async function fetchJson(url: string): Promise<unknown> {
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'Accept': 'application/json',
-      'User-Agent': 'KrakenTradingApp/1.0',
-    },
-    cache: 'no-store',
-  });
-  
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+function generateSignalFromThreshold(fundingRate: number): { signal: SignalType; confidence: number } {
+  // Use absolute thresholds when no historical data available
+  if (fundingRate >= FUNDING_THRESHOLDS.STRONG_SHORT) {
+    return { signal: 'STRONG_SHORT', confidence: 0.7 };
   }
-  
-  return response.json();
+  if (fundingRate >= FUNDING_THRESHOLDS.SHORT) {
+    return { signal: 'SHORT', confidence: 0.5 };
+  }
+  if (fundingRate <= FUNDING_THRESHOLDS.STRONG_LONG) {
+    return { signal: 'STRONG_LONG', confidence: 0.7 };
+  }
+  if (fundingRate <= FUNDING_THRESHOLDS.LONG) {
+    return { signal: 'LONG', confidence: 0.5 };
+  }
+  return { signal: 'NEUTRAL', confidence: 0 };
 }
 
-async function getBinanceHistoricalFunding(symbol: string): Promise<number[]> {
+async function getBinanceHistoricalFunding(symbol: string): Promise<{ rates: number[]; error?: string; rawResponse?: string }> {
   const binanceSymbol = BINANCE_SYMBOLS[symbol];
-  if (!binanceSymbol) return [];
+  if (!binanceSymbol) return { rates: [], error: 'Unknown symbol' };
   
   try {
-    // Get last 100 funding rate records (covers ~33 days at 8hr intervals)
     const url = `${BINANCE_BASE}/fapi/v1/fundingRate?symbol=${binanceSymbol}&limit=100`;
-    const data = await fetchJson(url) as BinanceFundingRate[];
     
-    if (!Array.isArray(data) || data.length === 0) {
-      return [];
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (compatible; TradingBot/1.0)',
+      },
+      cache: 'no-store',
+    });
+    
+    const text = await response.text();
+    
+    if (!response.ok) {
+      return { 
+        rates: [], 
+        error: `HTTP ${response.status}`,
+        rawResponse: text.slice(0, 200)
+      };
     }
     
-    // Convert funding rates to numbers
-    return data.map(d => parseFloat(d.fundingRate));
+    let data: BinanceFundingRate[];
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return { rates: [], error: 'JSON parse failed', rawResponse: text.slice(0, 200) };
+    }
+    
+    if (!Array.isArray(data)) {
+      return { 
+        rates: [], 
+        error: 'Response not array',
+        rawResponse: JSON.stringify(data).slice(0, 200)
+      };
+    }
+    
+    if (data.length === 0) {
+      return { rates: [], error: 'Empty array returned' };
+    }
+    
+    return { rates: data.map(d => parseFloat(d.fundingRate)) };
   } catch (error) {
-    console.error(`Binance funding fetch error for ${symbol}:`, error);
-    return [];
+    return { 
+      rates: [], 
+      error: error instanceof Error ? error.message : 'Unknown error'
+    };
   }
 }
 
@@ -126,7 +170,21 @@ export async function GET() {
 
   try {
     // Step 1: Get current prices from Kraken
-    const krakenData = await fetchJson(`${KRAKEN_BASE}/derivatives/api/v3/tickers`) as {
+    const krakenResponse = await fetch(`${KRAKEN_BASE}/derivatives/api/v3/tickers`, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' },
+      cache: 'no-store',
+    });
+    
+    if (!krakenResponse.ok) {
+      return NextResponse.json({
+        success: false,
+        error: `Kraken API error: ${krakenResponse.status}`,
+        timestamp: new Date().toISOString(),
+      }, { status: 502 });
+    }
+
+    const krakenData = await krakenResponse.json() as {
       result: string;
       tickers: KrakenTicker[];
     };
@@ -161,27 +219,41 @@ export async function GET() {
           continue;
         }
 
-        // Get historical funding from Binance (free!)
-        const historicalRates = await getBinanceHistoricalFunding(symbol);
+        // Get historical funding from Binance
+        const binanceResult = await getBinanceHistoricalFunding(symbol);
         
-        debug[`${symbol}_historicalCount`] = historicalRates.length;
+        debug[`${symbol}_binance`] = {
+          count: binanceResult.rates.length,
+          error: binanceResult.error,
+          raw: binanceResult.rawResponse,
+        };
 
         // Current funding rate from Kraken
         const currentFundingRate = ticker.fundingRate;
         
-        // Calculate Z-score using Binance historical data
+        // Calculate signal
         let zScore = 0;
         let signal: SignalType = 'NEUTRAL';
         let confidence = 0;
+        let signalSource: 'zscore' | 'threshold' = 'threshold';
 
-        if (historicalRates.length >= 10) {
-          // Use historical mean/std from Binance, apply to current Kraken rate
-          zScore = calculateZScore(historicalRates, currentFundingRate);
-          const generated = generateSignal(zScore);
+        if (binanceResult.rates.length >= 10) {
+          // Use Z-score method with historical data
+          zScore = calculateZScore(binanceResult.rates, currentFundingRate);
+          const generated = generateSignalFromZScore(zScore);
           signal = generated.signal;
           confidence = generated.confidence;
+          signalSource = 'zscore';
         } else {
-          errors.push(`Insufficient historical data for ${symbol} (got ${historicalRates.length})`);
+          // Fallback: use absolute thresholds
+          const generated = generateSignalFromThreshold(currentFundingRate);
+          signal = generated.signal;
+          confidence = generated.confidence;
+          signalSource = 'threshold';
+          
+          if (binanceResult.error) {
+            errors.push(`${symbol}: Binance ${binanceResult.error}, using thresholds`);
+          }
         }
 
         // Calculate 24h price change
@@ -202,6 +274,7 @@ export async function GET() {
           priceChange24h,
           confidence,
           timestamp: new Date().toISOString(),
+          signalSource,
         });
 
       } catch (err) {
@@ -210,8 +283,20 @@ export async function GET() {
       }
     }
 
-    // Sort by absolute Z-score (strongest signals first)
-    signals.sort((a, b) => Math.abs(b.zScore) - Math.abs(a.zScore));
+    // Sort by absolute Z-score, then by signal strength
+    signals.sort((a, b) => {
+      // First by signal type (STRONG > regular > NEUTRAL)
+      const signalOrder: Record<SignalType, number> = {
+        'STRONG_SHORT': 2, 'STRONG_LONG': 2,
+        'SHORT': 1, 'LONG': 1,
+        'NEUTRAL': 0
+      };
+      const orderDiff = signalOrder[b.signal] - signalOrder[a.signal];
+      if (orderDiff !== 0) return orderDiff;
+      
+      // Then by Z-score magnitude
+      return Math.abs(b.zScore) - Math.abs(a.zScore);
+    });
 
     return NextResponse.json({
       success: true,
@@ -223,7 +308,7 @@ export async function GET() {
         assetsTracked: ASSETS_TO_TRACK.length,
         signalsGenerated: signals.length,
         priceSource: 'Kraken Futures',
-        fundingHistorySource: 'Binance Futures (free)',
+        fundingHistorySource: 'Binance Futures (with threshold fallback)',
       }
     });
 
